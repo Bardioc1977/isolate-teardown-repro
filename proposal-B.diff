@@ -1,0 +1,65 @@
+diff --git a/substratevm/src/com.oracle.svm.core/src/com/oracle/svm/core/thread/VMThreads.java b/substratevm/src/com.oracle.svm.core/src/com/oracle/svm/core/thread/VMThreads.java
+index 2327dd26..90f4f5dd 100644
+--- a/substratevm/src/com.oracle.svm.core/src/com/oracle/svm/core/thread/VMThreads.java
++++ b/substratevm/src/com.oracle.svm.core/src/com/oracle/svm/core/thread/VMThreads.java
+@@ -48,7 +48,9 @@ import com.oracle.svm.core.imagelayer.ImageLayerBuildingSupport;
+ import com.oracle.svm.guest.staging.core.graal.KnownIntrinsics;
+ import com.oracle.svm.guest.staging.core.graal.MemoryBarriers;
+ import com.oracle.svm.guest.staging.core.graal.MemoryBarriers.BarrierKind;
++import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicInteger;
+ import com.oracle.svm.guest.staging.core.jdk.UninterruptibleUtils.AtomicWord;
++import jdk.graal.compiler.nodes.PauseNode;
+ import com.oracle.svm.core.locks.VMLockSupport;
+ import com.oracle.svm.core.locks.VMMutex;
+ import com.oracle.svm.guest.staging.log.Log;
+@@ -126,6 +128,14 @@ public abstract class VMThreads {
+      */
+     private static final AtomicWord<OSThreadHandle> detachedOsThreadToCleanup = new AtomicWord<>();
+ 
++    /**
++     * Number of attached (not started by this isolate) threads that are inside {@link #detachThread}.
++     * Such a thread still accesses the ThreadsLock (VMMutex, VMCondition) after it has been removed
++     * from the thread list and after it has released the lock. The isolate tear-down must not
++     * destroy these objects or unmap the heap before the count is zero again.
++     */
++    private static final AtomicInteger attachedThreadsInDetach = new AtomicInteger(0);
++
+     /**
+      * The next element in the linked list of {@link IsolateThread}s. A thread points to itself with
+      * this field after being removed from the linked list.
+@@ -410,6 +420,12 @@ public abstract class VMThreads {
+         boolean isCurrentThread = (thread == CurrentIsolate.getCurrentThread());
+         assert isCurrentThread && !ThreadsLock.hasAccess() || ThreadsLock.hasExclusiveWriteAccess();
+ 
++        /* Registered while the thread is still in the thread list, so the tear-down cannot miss it. */
++        boolean countedAsDetaching = isCurrentThread && !wasStartedByCurrentIsolate(thread);
++        if (countedAsDetaching) {
++            attachedThreadsInDetach.incrementAndGet();
++        }
++
+         OSThreadHandle threadToCleanup = Word.nullPointer();
+         if (isCurrentThread) {
+             ThreadsLock.lockWriteExclusive();
+@@ -446,6 +462,11 @@ public abstract class VMThreads {
+          */
+         cleanupExitedOsThread(threadToCleanup);
+         freeIsolateThread(thread);
++
++        /* Must be the last access of this thread to the isolate: the tear-down waits for this. */
++        if (countedAsDetaching) {
++            attachedThreadsInDetach.decrementAndGet();
++        }
+     }
+ 
+     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+@@ -562,6 +583,10 @@ public abstract class VMThreads {
+     @Uninterruptible(reason = "Only uninterruptible code may be executed after VMThreads#threadExit.")
+     public void waitUntilDetachedThreadsExitedOnOSLevel() {
+         cleanupExitedOsThreads();
++        /* Attached threads are not joined on the OS level, wait until they left detachThread(). */
++        while (attachedThreadsInDetach.get() != 0) {
++            PauseNode.pause();
++        }
+     }
+ 
+     /**

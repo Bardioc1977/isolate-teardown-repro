@@ -1,0 +1,37 @@
+diff --git a/truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java b/truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java
+index e1fb653a..b0a0db76 100644
+--- a/truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java
++++ b/truffle/src/com.oracle.truffle.runtime/src/com/oracle/truffle/runtime/BackgroundCompileQueue.java
+@@ -288,10 +288,29 @@ public class BackgroundCompileQueue {
+         if (e == null) {
+             return;
+         }
++        /*
++         * Proposal: keep waiting when this thread is interrupted. The caller (the isolate
++         * teardown thread of IsolateAwareTruffleCompiler) is interrupted by the teardown of the
++         * runtime isolate right away and would otherwise tear down the compiler isolate while
++         * compiler threads are still detaching from it.
++         */
++        boolean interrupted = false;
++        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
+         try {
+-            e.awaitTermination(timeout, TimeUnit.MILLISECONDS);
+-        } catch (InterruptedException ex) {
+-            throw new RuntimeException("Waiting for compiler threads was interrupted.", ex);
++            long remaining;
++            while ((remaining = deadline - System.nanoTime()) > 0) {
++                try {
++                    if (e.awaitTermination(remaining, TimeUnit.NANOSECONDS)) {
++                        break;
++                    }
++                } catch (InterruptedException ex) {
++                    interrupted = true;
++                }
++            }
++        } finally {
++            if (interrupted) {
++                Thread.currentThread().interrupt();
++            }
+         }
+     }
+ 
